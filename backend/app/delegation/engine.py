@@ -253,18 +253,9 @@ class DelegationEngine:
         if grant_expires < datetime.now(timezone.utc):
             return False, payload, "DELEGATION_EXPIRED", f"Delegation '{del_id}' expired at {grant_expires.isoformat()}"
 
-        # 4. Check Single-Use / Replay Protection
-        if grant.is_single_use:
-            if grant.is_consumed:
-                return False, payload, "REPLAY_ATTACK_DETECTED", f"Single-use delegation '{del_id}' has already been consumed"
-            
-            # Atomic in-memory check
-            replay_ok, replay_msg = self.security.check_and_consume_jti(jti, exp_timestamp)
-            if not replay_ok:
-                return False, payload, "REPLAY_ATTACK_DETECTED", replay_msg
-
-            grant.is_consumed = True
-            db.commit()
+        # 4. Reject already-consumed single-use delegations
+        if grant.is_single_use and grant.is_consumed:
+            return False, payload, "REPLAY_ATTACK_DETECTED", f"Single-use delegation '{del_id}' has already been consumed"
 
         # 5. Delegation Depth limit check
         if grant.current_depth > grant.max_depth:
@@ -304,6 +295,15 @@ class DelegationEngine:
             if parent_expires < datetime.now(timezone.utc):
                 return False, payload, "PARENT_DELEGATION_EXPIRED", f"Ancestor delegation '{curr_pdel_id}' in chain expired at {parent_expires.isoformat()}"
             curr_pdel_id = parent.parent_delegation_id
+
+        # Consume single-use grants only after every scope check succeeds.
+        if grant.is_single_use:
+            replay_ok, replay_msg = self.security.check_and_consume_jti(jti, exp_timestamp)
+            if not replay_ok:
+                return False, payload, "REPLAY_ATTACK_DETECTED", replay_msg
+
+            grant.is_consumed = True
+            db.commit()
 
         return True, payload, "DELEGATION_VALID", "Delegation credentials and hierarchy verified"
 

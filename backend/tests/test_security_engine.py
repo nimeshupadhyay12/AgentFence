@@ -532,3 +532,40 @@ def test_expired_parent_invalidates_child(db: Session):
     )
     assert valid is False
     assert code == "PARENT_DELEGATION_EXPIRED"
+
+
+# 20. A rejected scope check must not burn a single-use delegation
+def test_single_use_not_consumed_on_scope_failure(db: Session):
+    ok, grant, _, _ = delegation_engine.create_delegation(
+        db=db,
+        delegating_agent_id="usr_alpha_admin",
+        receiving_agent_id="agent_alpha_primary",
+        tenant_id="tenant_alpha",
+        permitted_tools=["read_document"],
+        permitted_actions=["read"],
+        resource_restrictions=["doc_alpha_falcon"],
+        duration_minutes=20,
+        is_single_use=True
+    )
+    assert ok is True
+
+    valid, payload, code, msg = delegation_engine.verify_active_delegation(
+        db=db,
+        delegation_token=grant.signature,
+        expected_agent_id="agent_alpha_primary",
+        expected_tool="export_tenant_report",
+        expected_action="read"
+    )
+    assert valid is False
+    assert code == "UNAUTHORIZED_TOOL_EXECUTION"
+
+    valid, payload, code, msg = delegation_engine.verify_active_delegation(
+        db=db,
+        delegation_token=grant.signature,
+        expected_agent_id="agent_alpha_primary",
+        expected_tool="read_document",
+        expected_action="read",
+        expected_resource="doc_alpha_falcon"
+    )
+    assert valid is True
+    assert code == "DELEGATION_VALID"
