@@ -394,3 +394,141 @@ def test_tenant_isolation_queries(db: Session):
         assert doc.tenant_id == "tenant_alpha"
     for doc in beta_docs:
         assert doc.tenant_id == "tenant_beta"
+
+
+def _as_utc(value: datetime) -> datetime:
+    return value.replace(tzinfo=timezone.utc) if value.tzinfo is None else value
+
+
+# 16. Only the parent grant's recipient may delegate its authority onward
+def test_child_grant_requires_parent_recipient(db: Session):
+    ok, parent, _, _ = delegation_engine.create_delegation(
+        db=db,
+        delegating_agent_id="usr_alpha_admin",
+        receiving_agent_id="agent_alpha_primary",
+        tenant_id="tenant_alpha",
+        permitted_tools=["read_document"],
+        permitted_actions=["read"],
+        resource_restrictions=["doc_alpha_falcon"],
+        duration_minutes=10
+    )
+    assert ok is True
+
+    ok, grant, code, msg = delegation_engine.create_delegation(
+        db=db,
+        delegating_agent_id="agent_alpha_research",
+        receiving_agent_id="agent_alpha_untrusted",
+        tenant_id="tenant_alpha",
+        permitted_tools=["read_document"],
+        permitted_actions=["read"],
+        resource_restrictions=["doc_alpha_falcon"],
+        parent_delegation_id=parent.delegation_id
+    )
+    assert ok is False
+    assert code == "DELEGATION_CHAIN_MISMATCH"
+
+
+# 17. Child expiry cannot outlive the parent grant
+def test_child_expiry_capped_by_parent(db: Session):
+    ok, parent, _, _ = delegation_engine.create_delegation(
+        db=db,
+        delegating_agent_id="usr_alpha_admin",
+        receiving_agent_id="agent_alpha_primary",
+        tenant_id="tenant_alpha",
+        permitted_tools=["read_document"],
+        permitted_actions=["read"],
+        resource_restrictions=["doc_alpha_falcon"],
+        duration_minutes=10
+    )
+    assert ok is True
+
+    ok, child, code, msg = delegation_engine.create_delegation(
+        db=db,
+        delegating_agent_id="agent_alpha_primary",
+        receiving_agent_id="agent_alpha_research",
+        tenant_id="tenant_alpha",
+        permitted_tools=["read_document"],
+        permitted_actions=["read"],
+        resource_restrictions=["doc_alpha_falcon"],
+        parent_delegation_id=parent.delegation_id,
+        duration_minutes=600
+    )
+    assert ok is True, msg
+
+    parent_exp = _as_utc(parent.expires_at)
+    child_exp = _as_utc(child.expires_at)
+    assert child_exp <= parent_exp
+
+    valid, payload, _ = security_engine.verify_delegation_credential(child.signature)
+    assert valid is True
+    assert payload["exp"] <= int(parent_exp.timestamp())
+
+
+# 18. Stored grant expiry is enforced even when the token is still valid
+def test_grant_expiry_enforced_even_with_valid_token(db: Session):
+    ok, grant, _, _ = delegation_engine.create_delegation(
+        db=db,
+        delegating_agent_id="usr_alpha_admin",
+        receiving_agent_id="agent_alpha_primary",
+        tenant_id="tenant_alpha",
+        permitted_tools=["read_document"],
+        permitted_actions=["read"],
+        resource_restrictions=["doc_alpha_falcon"],
+        duration_minutes=30
+    )
+    assert ok is True
+
+    grant.expires_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+    db.commit()
+
+    valid, payload, code, msg = delegation_engine.verify_active_delegation(
+        db=db,
+        delegation_token=grant.signature,
+        expected_agent_id="agent_alpha_primary",
+        expected_tool="read_document",
+        expected_action="read"
+    )
+    assert valid is False
+    assert code == "DELEGATION_EXPIRED"
+
+
+# 19. An expired parent invalidates its descendants
+def test_expired_parent_invalidates_child(db: Session):
+    ok, parent, _, _ = delegation_engine.create_delegation(
+        db=db,
+        delegating_agent_id="usr_alpha_admin",
+        receiving_agent_id="agent_alpha_primary",
+        tenant_id="tenant_alpha",
+        permitted_tools=["read_document"],
+        permitted_actions=["read"],
+        resource_restrictions=["doc_alpha_falcon"],
+        duration_minutes=10
+    )
+    assert ok is True
+
+    ok, child, code, msg = delegation_engine.create_delegation(
+        db=db,
+        delegating_agent_id="agent_alpha_primary",
+        receiving_agent_id="agent_alpha_research",
+        tenant_id="tenant_alpha",
+        permitted_tools=["read_document"],
+        permitted_actions=["read"],
+        resource_restrictions=["doc_alpha_falcon"],
+        parent_delegation_id=parent.delegation_id,
+        duration_minutes=5
+    )
+    assert ok is True, msg
+
+    parent.expires_at = datetime.now(timezone.utc) - timedelta(minutes=1)
+    db.commit()
+
+    valid, payload, code, msg = delegation_engine.verify_active_delegation(
+        db=db,
+        delegation_token=child.signature,
+        expected_agent_id="agent_alpha_research",
+        expected_tool="read_document",
+        expected_action="read",
+        expected_resource="doc_alpha_falcon"
+    )
+    assert valid is False
+    assert code == "PARENT_DELEGATION_EXPIRED"

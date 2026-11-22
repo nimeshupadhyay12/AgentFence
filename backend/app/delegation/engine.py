@@ -1,7 +1,7 @@
 """AgentFence Delegation Engine: Attenuation Verification, Depth Enforcement, and Chain Validation
 """
 import json
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from typing import Dict, Any, List, Optional, Tuple
 from sqlalchemy.orm import Session
 from app.models.entities import DelegationGrant, Agent, User
@@ -88,7 +88,7 @@ class DelegationEngine:
     ) -> Tuple[bool, Optional[DelegationGrant], str, str]:
         """Creates a signed delegation credential with strict attenuation checks."""
         now = datetime.now(timezone.utc)
-        requested_expires = now + (timedelta(minutes=duration_minutes) if 'timedelta' in globals() else __import__('datetime').timedelta(minutes=duration_minutes))
+        requested_expires = now + timedelta(minutes=duration_minutes)
         
         # Verify receiving agent exists in same tenant
         rcv_agent = db.query(Agent).filter(Agent.id == receiving_agent_id, Agent.tenant_id == tenant_id).first()
@@ -121,6 +121,13 @@ class DelegationEngine:
                 parent_exp = parent_exp.replace(tzinfo=timezone.utc)
             if parent_exp < now:
                 return False, None, "PARENT_DELEGATION_EXPIRED", f"Parent delegation '{parent_delegation_id}' has already expired"
+
+            # The parent grant's authority belongs to its receiving agent.
+            if parent_grant.receiving_agent_id != delegating_agent_id:
+                return False, None, "DELEGATION_CHAIN_MISMATCH", (
+                    f"Agent '{delegating_agent_id}' cannot delegate from grant "
+                    f"'{parent_delegation_id}' issued to '{parent_grant.receiving_agent_id}'"
+                )
 
             # Automatically clamp child expiration to at most parent expiration
             if requested_expires > parent_exp:
@@ -158,7 +165,7 @@ class DelegationEngine:
             max_depth=max_depth,
             current_depth=current_depth,
             audience=audience,
-            expires_in_minutes=duration_minutes,
+            expires_at=requested_expires,
             is_single_use=is_single_use
         )
 
@@ -239,6 +246,13 @@ class DelegationEngine:
         if grant.is_revoked:
             return False, payload, "DELEGATION_REVOKED", f"Delegation '{del_id}' was revoked by administrator"
 
+        # The stored grant expiry is authoritative even if a token outlives it.
+        grant_expires = grant.expires_at
+        if grant_expires.tzinfo is None:
+            grant_expires = grant_expires.replace(tzinfo=timezone.utc)
+        if grant_expires < datetime.now(timezone.utc):
+            return False, payload, "DELEGATION_EXPIRED", f"Delegation '{del_id}' expired at {grant_expires.isoformat()}"
+
         # 4. Check Single-Use / Replay Protection
         if grant.is_single_use:
             if grant.is_consumed:
@@ -284,6 +298,11 @@ class DelegationEngine:
                 return False, payload, "BROKEN_DELEGATION_CHAIN", f"Ancestor delegation '{curr_pdel_id}' missing in chain"
             if parent.is_revoked:
                 return False, payload, "PARENT_DELEGATION_REVOKED", f"Ancestor delegation '{curr_pdel_id}' in chain is revoked"
+            parent_expires = parent.expires_at
+            if parent_expires.tzinfo is None:
+                parent_expires = parent_expires.replace(tzinfo=timezone.utc)
+            if parent_expires < datetime.now(timezone.utc):
+                return False, payload, "PARENT_DELEGATION_EXPIRED", f"Ancestor delegation '{curr_pdel_id}' in chain expired at {parent_expires.isoformat()}"
             curr_pdel_id = parent.parent_delegation_id
 
         return True, payload, "DELEGATION_VALID", "Delegation credentials and hierarchy verified"

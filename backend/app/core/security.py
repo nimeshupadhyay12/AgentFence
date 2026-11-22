@@ -97,11 +97,17 @@ class SecurityEngine:
         current_depth: int,
         audience: Optional[str] = None,
         expires_in_minutes: int = 30,
+        expires_at: Optional[datetime] = None,
         is_single_use: bool = False,
         custom_claims: Optional[Dict[str, Any]] = None
     ) -> str:
         now = datetime.now(timezone.utc)
-        exp = now + timedelta(minutes=expires_in_minutes)
+        if expires_at is not None:
+            if expires_at.tzinfo is None:
+                expires_at = expires_at.replace(tzinfo=timezone.utc)
+            exp = expires_at
+        else:
+            exp = now + timedelta(minutes=expires_in_minutes)
         jti = self.generate_id("del_jti")
 
         payload = {
