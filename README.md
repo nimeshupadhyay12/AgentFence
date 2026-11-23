@@ -199,7 +199,7 @@ Interactive docs at http://127.0.0.1:8080/docs (generated from the same route ta
 | POST | `/api/v1/tools` | platform admin | Register a tool (poisoning scan → quarantine; upstream allowlist) |
 | GET | `/api/v1/delegations` | auth | Admin: tenant's grants; others: grants they issued/received/originated. **No raw tokens.** |
 | POST | `/api/v1/delegations` | auth | Issue a delegation as the caller; credential returned **once** |
-| POST | `/api/v1/delegations/revoke/{id}` | auth | Tenant admin, original user or delegator; cascades to descendants |
+| POST | `/api/v1/delegations/revoke/{id}` | auth | Tenant admin, platform admin, original user or delegator; cascades to descendants |
 | GET | `/api/v1/policies` | tenant admin | Policies of own tenant |
 | POST | `/api/v1/policies/{id}/toggle` | tenant admin | Enable/disable (audited) |
 | POST | `/api/v1/policies/simulate` | tenant admin | Dry-run the PDP (role and action looked up server-side) |

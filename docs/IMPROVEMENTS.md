@@ -29,7 +29,9 @@ it targets), CI added, management API authenticated.
 
 * Every `/api/v1` endpoint except `health` and `auth/login` requires a token, enforced by one
   `@endpoint(admin=..., platform_admin=...)` decorator **before** the handler runs; every 401/403
-  is written to the audit chain (`api.access_denied`).
+  raised by the decorator is written to the audit chain (`api.access_denied`). Refusals raised
+  inside handlers are audited under their own event types, and some object-level 404s (e.g.
+  toggling a foreign policy) are not audited yet.
 * Function-level roles: tenant admin (policies, audit, metrics, approvals decisions), platform
   admin (tool registration, simulations, audit export). Object-level scoping inside handlers:
   tenant admins only see/modify their own tenant; non-admins only see delegations they issued,
@@ -50,7 +52,7 @@ it targets), CI added, management API authenticated.
   issued to them; attenuation covers tools, resources ("unrestricted" counts as wider), expiry,
   depth and single-use parents.
 * `MAX_DELEGATION_DEPTH` and `MAX_DELEGATION_TTL` are now enforced (they were defined but unused).
-* Revocation is permitted to the tenant admin, original user or delegator, is audited and
+* Revocation is permitted to the tenant admin, platform admin, original user or delegator, is audited and
   cascades (descendants fail chain verification). Chain verification also checks that each link
   was issued by the recipient of its parent.
 
@@ -67,22 +69,26 @@ it targets), CI added, management API authenticated.
 * Durable and atomic: a single-use credential is burned by inserting its `jti` into
   `replay_identifiers` (UNIQUE) **and** a conditional `UPDATE ... WHERE is_consumed = 0`, in one
   transaction. It works across threads, worker processes and restarts (v1 used an unlocked
-  in-memory dict). Consumption happens only after every other check passed, so a denied call does
-  not burn the credential.
+  in-memory dict). Consumption happens only after the delegation, policy and chain-wide checks
+  passed, so a call denied by those checks does not burn the credential. Known edge case: for a
+  delegated call that also needs human approval, the single-use grant is consumed just before the
+  approval is marked USED, so losing a race on the approval burns the grant.
 * Identity tokens: 15-minute lifetime + `jti` revocation instead of reusable 60-minute tokens.
 * `UPSTREAM_ALLOWLIST` is now used (see 9).
 
 ## 7. Audit trail [6]
 
-* `record_hash = SHA-256(canonical JSON of every stored field incl. details and previous hash)`;
+* `record_hash = SHA-256(canonical JSON of every stored data field incl. details and previous hash)`
+  (21 of 22 columns; only the auto-increment `seq` key is excluded, and order is still protected by
+  the previous-hash pointer);
   v1 hashed only 11 fields, so editing `attack_classification` or `execution_outcome` went unnoticed.
 * `previous_record_hash` is UNIQUE, so two concurrent writers cannot fork the chain (the loser
   retries on the new head).
 * New event types: `auth.login`, `auth.logout`, `delegation.create` (allow and reject),
   `delegation.revoke`, `policy.toggle`, `approval.decision`, `tool.register`, `api.access_denied`,
   plus `reason_code` on every event. v1 attacks 3 and 8 left no record; now they do.
-* Tests tamper with **each** hashed field in turn, and delete a record, and require verification
-  to fail.
+* Tests tamper with each of 20 hashed fields in turn (the chain pointer is covered by the
+  delete-record test), and delete a record, and require verification to fail.
 * Existing chains: a pre-v2 database is moved aside on first start in dev mode
   (`agentfence.db.v1-<timestamp>.bak`) rather than re-chained, so the original evidence is
   untouched; `scripts/audit_cli.py verify-legacy <file>` still verifies it with the v1 algorithm.
@@ -118,7 +124,8 @@ it targets), CI added, management API authenticated.
 * Optional real upstream: tools whose `upstream_endpoint` is `http(s)://` are forwarded as JSON-RPC
   `tools/call` if the origin is in `AGENTFENCE_UPSTREAM_ALLOWLIST` (checked at registration and at
   call time); caller tokens are never forwarded. `scripts/sample_upstream_mcp.py` is a minimal
-  real MCP server used by an end-to-end test. The in-process mock remains the default.
+  real MCP server used by an end-to-end test (the test runs it in-process through Starlette's test
+  transport, not over a network socket). The in-process mock remains the default.
 * Tool registration (`POST /api/v1/tools`) scans names, descriptions and schema descriptions for
   tool-poisoning markers (instruction overrides, hidden tags, concealment, credential
   exfiltration, cross-tool hijacking, invisible Unicode) and stores matches **quarantined**.
