@@ -4,8 +4,14 @@ Run from repository root:
     python -m pip install playwright
     python -m playwright install chromium
     python scripts/capture_readme_screenshots.py
+
+The dashboard requires a login. The script signs in as --username (default
+secops_admin) with the password from AGENTFENCE_SCREENSHOT_PASSWORD, or from
+backend/data/demo_credentials.json written by the demo seed.
 """
 import argparse
+import json
+import os
 import re
 from pathlib import Path
 from playwright.sync_api import sync_playwright
@@ -17,6 +23,7 @@ PAGES = [
     ("Live Audit Events", "audit-events"),
     ("Delegation Explorer", "delegations"),
     ("Policy Management", "policies"),
+    ("Approvals", "approvals"),
     ("Agents & Tools", "agents-and-tools"),
     ("Attack Simulation Lab", "attack-lab"),
     ("Tenant Management", "tenants"),
@@ -28,7 +35,14 @@ END = "<!-- SCREENSHOTS_END -->"
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--url", default="http://127.0.0.1:8080/")
+    parser.add_argument("--username", default="secops_admin")
     args = parser.parse_args()
+    password = os.getenv("AGENTFENCE_SCREENSHOT_PASSWORD")
+    creds_file = ROOT / "backend" / "data" / "demo_credentials.json"
+    if not password and creds_file.exists():
+        password = json.loads(creds_file.read_text(encoding="utf-8"))["users"].get(args.username)
+    if not password:
+        parser.error("Set AGENTFENCE_SCREENSHOT_PASSWORD or start the backend once to create demo_credentials.json")
     if not re.match(r"^http://(127\.0\.0\.1|localhost):\d+/?$", args.url):
         parser.error("Use only a local http://127.0.0.1:<port>/ address")
     readme = ROOT / "README.md"
@@ -41,6 +55,9 @@ def main():
         page = browser.new_page(viewport={"width": 1440, "height": 900}, device_scale_factor=1)
         try:
             page.goto(args.url, wait_until="domcontentloaded", timeout=15000)
+            page.fill("#username", args.username)
+            page.fill("#password", password)
+            page.click("button:has-text('Sign in')")
             page.locator(".sidebar .nav-item").first.wait_for(timeout=10000)
             for title, slug in PAGES:
                 try:
