@@ -39,9 +39,8 @@ pnpm-debug.log*
 frontend/dist/
 frontend/node_modules/
 
-# Local databases & logs
-backend/data/*.db
-backend/data/*.log
+# Local databases, logs, generated dev secrets & credentials
+backend/data/
 *.db
 *.sqlite
 *.sqlite3

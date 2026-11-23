@@ -5,7 +5,7 @@ from pathlib import Path
 
 # Base Paths
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
-DB_DIR = BASE_DIR / "data"
+DB_DIR = Path(os.getenv("AGENTFENCE_DATA_DIR", str(BASE_DIR / "data")))
 DB_DIR.mkdir(parents=True, exist_ok=True)
 SQLITE_PATH = DB_DIR / "agentfence.db"
 
