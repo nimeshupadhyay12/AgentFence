@@ -4,14 +4,16 @@ import { TabType } from '../App';
 interface SidebarProps {
   activeTab: TabType;
   onSelectTab: (tab: TabType) => void;
+  tabs: TabType[];
 }
 
-export default function Sidebar({ activeTab, onSelectTab }: SidebarProps) {
+export default function Sidebar({ activeTab, onSelectTab, tabs }: SidebarProps) {
   const navItems: Array<{ id: TabType; label: string; icon: string }> = [
     { id: 'overview', label: 'Overview', icon: 'fa-chart-line' },
     { id: 'audit', label: 'Live Audit Events', icon: 'fa-list-check' },
     { id: 'delegation', label: 'Delegation Explorer', icon: 'fa-diagram-project' },
     { id: 'policy', label: 'Policy Management', icon: 'fa-scale-balanced' },
+    { id: 'approvals', label: 'Approvals', icon: 'fa-user-check' },
     { id: 'registry', label: 'Agents & Tools', icon: 'fa-cubes-stacked' },
     { id: 'attack-lab', label: 'Attack Simulation Lab', icon: 'fa-flask-vial' },
     { id: 'tenants', label: 'Tenant Management', icon: 'fa-building-shield' },
@@ -27,7 +29,7 @@ export default function Sidebar({ activeTab, onSelectTab }: SidebarProps) {
         </div>
       </div>
       <ul className="nav-links">
-        {navItems.map((item) => (
+        {navItems.filter((item) => tabs.includes(item.id)).map((item) => (
           <li
             key={item.id}
             className={`nav-item ${activeTab === item.id ? 'active' : ''}`}

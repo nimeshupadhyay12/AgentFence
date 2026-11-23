@@ -1,13 +1,16 @@
 import React, { useEffect, useState } from 'react';
-import { api, PolicyInfo } from '../services/api';
+import { api, ApiError, PolicyInfo, Principal } from '../services/api';
 
-export default function PolicyManagementPage() {
+interface PolicyManagementPageProps {
+  principal: Principal;
+}
+
+export default function PolicyManagementPage({ principal: operator }: PolicyManagementPageProps) {
   const [policies, setPolicies] = useState<PolicyInfo[]>([]);
-  const [tenant, setTenant] = useState('tenant_alpha');
+  const [tenant, setTenant] = useState(operator.is_platform_admin ? 'tenant_alpha' : operator.tenant_id);
   const [principal, setPrincipal] = useState('agent_alpha_primary');
-  const [role, setRole] = useState('coordinator');
+  const [assumeDelegation, setAssumeDelegation] = useState(true);
   const [tool, setTool] = useState('read_document');
-  const [action, setAction] = useState('read');
   const [resource, setResource] = useState('doc_alpha_falcon');
   const [simResult, setSimResult] = useState<any>(null);
 
@@ -25,7 +28,11 @@ export default function PolicyManagementPage() {
   }, []);
 
   const handleToggle = async (id: string) => {
-    await api.togglePolicy(id);
+    try {
+      await api.togglePolicy(id);
+    } catch (e) {
+      alert(e instanceof ApiError ? e.message : 'Toggle failed');
+    }
     fetchPolicies();
   };
 
@@ -34,14 +41,14 @@ export default function PolicyManagementPage() {
       const res = await api.simulatePolicy({
         tenant_id: tenant,
         principal_id: principal,
-        principal_role: role,
         tool_name: tool,
-        action: action,
-        resource_id: resource,
+        resource_id: resource || undefined,
+        assume_delegation: assumeDelegation,
       });
       setSimResult(res);
     } catch (e) {
-      console.error(e);
+      setSimResult({ decision: 'ERROR', reason_code: e instanceof ApiError ? e.code : 'ERROR',
+                     explanation: e instanceof ApiError ? e.message : 'Request failed' });
     }
   };
 
@@ -50,14 +57,19 @@ export default function PolicyManagementPage() {
       <div className="card-panel" style={{ borderLeft: '4px solid var(--accent-cyan)' }}>
         <h3 className="card-title">Policy Decision Simulator</h3>
         <p style={{ fontSize: '12px', color: 'var(--text-muted)', marginBottom: '14px' }}>
-          Evaluate authorization policies directly against the live Policy Decision Point (PDP).
+          Dry-run the live Policy Decision Point. The principal's role and the tool's action are looked up on the
+          server, exactly as the gateway does for a real call.
         </p>
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(3, 1fr)', gap: '12px', marginBottom: '14px' }}>
           <div className="form-group">
             <label className="form-label">Tenant Context</label>
-            <select className="form-select" value={tenant} onChange={(e) => setTenant(e.target.value)}>
+            <select className="form-select" value={tenant} onChange={(e) => setTenant(e.target.value)}
+                    disabled={!operator.is_platform_admin}>
               <option value="tenant_alpha">Tenant Alpha</option>
               <option value="tenant_beta">Tenant Beta</option>
+              {!['tenant_alpha', 'tenant_beta'].includes(operator.tenant_id) && (
+                <option value={operator.tenant_id}>{operator.tenant_id}</option>
+              )}
             </select>
           </div>
           <div className="form-group">
@@ -65,8 +77,11 @@ export default function PolicyManagementPage() {
             <input className="form-input" value={principal} onChange={(e) => setPrincipal(e.target.value)} />
           </div>
           <div className="form-group">
-            <label className="form-label">Principal Role</label>
-            <input className="form-input" value={role} onChange={(e) => setRole(e.target.value)} />
+            <label className="form-label">Delegation context</label>
+            <label style={{ fontSize: '12.5px' }}>
+              <input type="checkbox" checked={assumeDelegation} onChange={(e) => setAssumeDelegation(e.target.checked)} />
+              {' '}Assume a valid delegation is presented
+            </label>
           </div>
           <div className="form-group">
             <label className="form-label">MCP Tool</label>
@@ -77,10 +92,6 @@ export default function PolicyManagementPage() {
               <option value="export_tenant_report">export_tenant_report</option>
               <option value="admin_override">admin_override</option>
             </select>
-          </div>
-          <div className="form-group">
-            <label className="form-label">Action</label>
-            <input className="form-input" value={action} onChange={(e) => setAction(e.target.value)} />
           </div>
           <div className="form-group">
             <label className="form-label">Resource ID</label>
@@ -99,6 +110,7 @@ export default function PolicyManagementPage() {
             </div>
             <p style={{ fontSize: '12.5px', color: 'var(--text-muted)', marginTop: '6px' }}>
               {simResult.explanation} {simResult.matched_policy && `[Matched: ${simResult.matched_policy}]`}
+              {simResult.requires_approval && ' This tool additionally requires human approval at call time.'}
             </p>
           </div>
         )}

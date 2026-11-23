@@ -32,10 +32,7 @@ export default function OverviewPage({ onNavigate }: OverviewPageProps) {
   }, []);
 
   const totalIncidents = metrics
-    ? metrics.security_incidents.cross_tenant_attempts +
-      metrics.security_incidents.confused_deputy_attempts +
-      metrics.security_incidents.privilege_escalation_attempts +
-      metrics.security_incidents.replay_attempts
+    ? Object.values(metrics.security_incidents).reduce((sum, n) => sum + n, 0)
     : 0;
 
   return (
@@ -59,7 +56,7 @@ export default function OverviewPage({ onNavigate }: OverviewPageProps) {
         <div className="stat-card">
           <div className="stat-header">Security Incidents</div>
           <div className="stat-value" style={{ color: 'var(--status-warn)' }}>{totalIncidents}</div>
-          <div className="stat-footer">Attacks Blocked by Gateway</div>
+          <div className="stat-footer">Classified attack attempts in the audit log</div>
         </div>
       </div>
 
@@ -85,6 +82,7 @@ export default function OverviewPage({ onNavigate }: OverviewPageProps) {
             <tr>
               <th>Timestamp</th>
               <th>Tenant</th>
+              <th>Event</th>
               <th>Agent / Principal</th>
               <th>Tool</th>
               <th>Action</th>
@@ -98,17 +96,18 @@ export default function OverviewPage({ onNavigate }: OverviewPageProps) {
               <tr key={e.id}>
                 <td style={{ fontSize: '11px', color: 'var(--text-dim)' }}>{e.timestamp.split('T')[1]?.substring(0, 8)}</td>
                 <td><span className="code-pill">{e.tenant_id}</span></td>
-                <td><strong>{e.agent_id || 'user'}</strong></td>
-                <td><span className="code-pill">{e.tool}</span></td>
-                <td>{e.action}</td>
+                <td style={{ fontSize: '11px' }}>{e.event_type}</td>
+                <td><strong>{e.agent_id || e.user_id || '-'}</strong></td>
+                <td>{e.tool ? <span className="code-pill">{e.tool}</span> : '-'}</td>
+                <td>{e.action || '-'}</td>
                 <td>{e.resource_id ? <span className="code-pill">{e.resource_id}</span> : '-'}</td>
                 <td>
-                  <span className={`badge ${e.decision === 'ALLOW' ? 'badge-allow' : 'badge-deny'}`}>
+                  <span className={`badge ${e.decision === 'ALLOW' ? 'badge-allow' : e.decision === 'PENDING' ? 'badge-warn' : 'badge-deny'}`}>
                     {e.decision}
                   </span>
                 </td>
                 <td style={{ fontSize: '11.5px', color: e.decision === 'ALLOW' ? 'var(--status-allow)' : 'var(--status-deny)' }}>
-                  {e.reason || 'Authorized'}
+                  {e.reason || e.reason_code || 'Authorized'}
                 </td>
               </tr>
             ))}

@@ -1,39 +1,113 @@
 /**
- * AgentFence Frontend API Client Service
+ * AgentFence dashboard API client.
+ *
+ * Every management call carries the operator's identity token
+ * (`Authorization: Bearer ...`). The token is short-lived (15 minutes) and is
+ * kept in sessionStorage so it disappears when the tab is closed; a 401 from
+ * the gateway clears it and returns the user to the login screen.
  */
 
 const API_BASE = (typeof window !== 'undefined' && window.location.protocol === 'file:')
   ? 'http://127.0.0.1:8080'
   : '';
 
+const TOKEN_KEY = 'agentfence.token';
+const PRINCIPAL_KEY = 'agentfence.principal';
+
+export interface Principal {
+  id: string;
+  type: 'user' | 'agent';
+  tenant_id: string;
+  role: string;
+  is_admin: boolean;
+  is_platform_admin: boolean;
+}
+
+export class ApiError extends Error {
+  constructor(public status: number, public code: string, message: string) {
+    super(message);
+  }
+}
+
+let unauthorizedHandler: (() => void) | null = null;
+
+export const session = {
+  token(): string | null {
+    try { return sessionStorage.getItem(TOKEN_KEY); } catch { return null; }
+  },
+  principal(): Principal | null {
+    try {
+      const raw = sessionStorage.getItem(PRINCIPAL_KEY);
+      return raw ? (JSON.parse(raw) as Principal) : null;
+    } catch { return null; }
+  },
+  save(token: string, principal: Principal) {
+    try {
+      sessionStorage.setItem(TOKEN_KEY, token);
+      sessionStorage.setItem(PRINCIPAL_KEY, JSON.stringify(principal));
+    } catch { /* storage unavailable: session lasts until reload */ }
+  },
+  clear() {
+    try {
+      sessionStorage.removeItem(TOKEN_KEY);
+      sessionStorage.removeItem(PRINCIPAL_KEY);
+    } catch { /* ignore */ }
+  },
+  onUnauthorized(handler: () => void) {
+    unauthorizedHandler = handler;
+  },
+};
+
+async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
+  const headers = new Headers(init.headers);
+  const token = session.token();
+  if (token) headers.set('Authorization', `Bearer ${token}`);
+  if (init.body) headers.set('Content-Type', 'application/json');
+  const res = await fetch(`${API_BASE}${path}`, { ...init, headers });
+  let body: any = null;
+  try { body = await res.json(); } catch { body = null; }
+  if (res.status === 401 && token) {
+    session.clear();
+    unauthorizedHandler?.();
+  }
+  // A rejected delegation (403 with {success:false}) is a normal, displayable result.
+  const displayable = res.status === 403 && body && typeof body === 'object' && 'success' in body;
+  if (!res.ok && !displayable) {
+    throw new ApiError(res.status, body?.code ?? 'HTTP_ERROR', body?.error ?? body?.message ?? res.statusText);
+  }
+  return body as T;
+}
+
+const post = <T>(path: string, data?: unknown) =>
+  request<T>(path, { method: 'POST', body: data === undefined ? undefined : JSON.stringify(data) });
+
 export interface HealthStatus {
   status: string;
   service: string;
   version: string;
   protocol: string;
-  engine: string;
+  environment: string;
 }
 
 export interface SecurityMetrics {
   total_requests: number;
   allowed_requests: number;
   denied_requests: number;
-  security_incidents: {
-    cross_tenant_attempts: number;
-    confused_deputy_attempts: number;
-    privilege_escalation_attempts: number;
-    replay_attempts: number;
-  };
+  pending_approvals: number;
+  security_incidents: Record<string, number>;
   tool_distribution: Array<{ tool: string; count: number }>;
   recent_events: Array<{
     id: string;
+    event_type: string;
     timestamp: string;
     tenant_id: string;
-    agent_id: string;
-    tool: string;
-    action: string;
+    agent_id?: string;
+    user_id?: string;
+    tool?: string;
+    action?: string;
     resource_id?: string;
     decision: string;
+    reason_code?: string;
     reason?: string;
     attack_classification?: string;
   }>;
@@ -68,8 +142,14 @@ export interface MCPToolInfo {
   parameters_schema: any;
   required_scopes: string[];
   risk_level: string;
+  action: string;
+  resource_param?: string | null;
+  requires_approval: boolean;
+  rate_limit_per_minute?: number | null;
   upstream_endpoint: string;
   is_enabled: boolean;
+  is_quarantined: boolean;
+  quarantine_reason?: string | null;
 }
 
 export interface DelegationGrantInfo {
@@ -79,6 +159,7 @@ export interface DelegationGrantInfo {
   tenant_id: string;
   original_user_id: string;
   delegating_agent_id: string;
+  delegator_type: string;
   receiving_agent_id: string;
   permitted_tools: string[];
   permitted_actions: string[];
@@ -89,7 +170,8 @@ export interface DelegationGrantInfo {
   is_consumed: boolean;
   is_revoked: boolean;
   expires_at: string;
-  signature: string;
+  jti: string;
+  token_fingerprint: string;
 }
 
 export interface PolicyInfo {
@@ -112,6 +194,7 @@ export interface PolicyInfo {
 export interface AuditEventInfo {
   id: string;
   seq: number;
+  event_type: string;
   request_id: string;
   correlation_id: string;
   timestamp: string;
@@ -119,10 +202,11 @@ export interface AuditEventInfo {
   user_id?: string;
   agent_id?: string;
   delegation_id?: string;
-  tool: string;
-  action: string;
+  tool?: string;
+  action?: string;
   resource_id?: string;
-  decision: 'ALLOW' | 'DENY';
+  decision: 'ALLOW' | 'DENY' | 'PENDING';
+  reason_code?: string;
   denial_reason?: string;
   attack_classification?: string;
   execution_outcome: string;
@@ -130,10 +214,31 @@ export interface AuditEventInfo {
   record_hash: string;
 }
 
-export interface AttackSimulationResult {
+export interface ApprovalInfo {
+  id: string;
+  tenant_id: string;
+  requester_id: string;
+  requester_type: string;
+  tool_name: string;
+  arguments: Record<string, unknown>;
+  delegation_id?: string;
+  status: 'PENDING' | 'APPROVED' | 'DENIED' | 'USED';
+  created_at: string;
+  expires_at: string;
+  decided_by?: string;
+  decision_note?: string;
+}
+
+export interface ScenarioInfo {
   key: string;
-  scenario_name: string;
+  name: string;
+  description: string;
+  owasp: string;
   expected_result: string;
+}
+
+export interface AttackSimulationResult extends ScenarioInfo {
+  scenario_name: string;
   actual_result: string;
   passed: boolean;
   request_details: any;
@@ -142,99 +247,57 @@ export interface AttackSimulationResult {
 }
 
 export const api = {
-  async getHealth(): Promise<HealthStatus> {
-    const res = await fetch(`${API_BASE}/api/v1/health`);
-    return res.json();
+  async login(username: string, password: string): Promise<Principal> {
+    const res = await post<{ access_token: string; principal: Principal }>('/api/v1/auth/login', { username, password });
+    session.save(res.access_token, res.principal);
+    return res.principal;
   },
 
-  async getMetrics(): Promise<SecurityMetrics> {
-    const res = await fetch(`${API_BASE}/api/v1/metrics/overview`);
-    return res.json();
+  async logout(): Promise<void> {
+    try { await post('/api/v1/auth/logout'); } finally { session.clear(); }
   },
 
-  async getTenants(): Promise<TenantInfo[]> {
-    const res = await fetch(`${API_BASE}/api/v1/tenants`);
-    return res.json();
-  },
+  getHealth: () => request<HealthStatus>('/api/v1/health'),
+  getMetrics: () => request<SecurityMetrics>('/api/v1/metrics/overview'),
+  getTenants: () => request<TenantInfo[]>('/api/v1/tenants'),
+  getTenantDetails: (id: string) => request<any>(`/api/v1/tenants/${encodeURIComponent(id)}`),
+  getAgents: () => request<AgentInfo[]>('/api/v1/agents'),
+  getTools: () => request<MCPToolInfo[]>('/api/v1/tools'),
+  getDelegations: () => request<DelegationGrantInfo[]>('/api/v1/delegations'),
+  createDelegation: (data: {
+    receiving_agent_id: string;
+    parent_delegation_id?: string | null;
+    permitted_tools: string[];
+    resource_restrictions: string[];
+    duration_minutes: number;
+    is_single_use?: boolean;
+  }) => post<any>('/api/v1/delegations', data),
+  revokeDelegation: (id: string) => post<any>(`/api/v1/delegations/revoke/${encodeURIComponent(id)}`),
+  getPolicies: () => request<PolicyInfo[]>('/api/v1/policies'),
+  togglePolicy: (id: string) => post<any>(`/api/v1/policies/${encodeURIComponent(id)}/toggle`),
+  simulatePolicy: (params: {
+    tenant_id?: string;
+    principal_id: string;
+    tool_name: string;
+    resource_id?: string;
+    assume_delegation?: boolean;
+  }) => post<any>('/api/v1/policies/simulate', params),
+  getApprovals: () => request<ApprovalInfo[]>('/api/v1/approvals'),
+  decideApproval: (id: string, decision: 'approve' | 'deny', note?: string) =>
+    post<any>(`/api/v1/approvals/${encodeURIComponent(id)}/decision`, { decision, note }),
 
-  async getTenantDetails(id: string): Promise<any> {
-    const res = await fetch(`${API_BASE}/api/v1/tenants/${id}`);
-    return res.json();
-  },
-
-  async getAgents(tenantId?: string): Promise<AgentInfo[]> {
-    const url = tenantId ? `${API_BASE}/api/v1/agents?tenant_id=${tenantId}` : `${API_BASE}/api/v1/agents`;
-    const res = await fetch(url);
-    return res.json();
-  },
-
-  async getTools(): Promise<MCPToolInfo[]> {
-    const res = await fetch(`${API_BASE}/api/v1/tools`);
-    return res.json();
-  },
-
-  async getDelegations(tenantId?: string): Promise<DelegationGrantInfo[]> {
-    const url = tenantId ? `${API_BASE}/api/v1/delegations?tenant_id=${tenantId}` : `${API_BASE}/api/v1/delegations`;
-    const res = await fetch(url);
-    return res.json();
-  },
-
-  async createDelegation(data: any): Promise<any> {
-    const res = await fetch(`${API_BASE}/api/v1/delegations`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(data),
-    });
-    return res.json();
-  },
-
-  async revokeDelegation(id: string): Promise<any> {
-    const res = await fetch(`${API_BASE}/api/v1/delegations/revoke/${id}`, { method: 'POST' });
-    return res.json();
-  },
-
-  async getPolicies(tenantId?: string): Promise<PolicyInfo[]> {
-    const url = tenantId ? `${API_BASE}/api/v1/policies?tenant_id=${tenantId}` : `${API_BASE}/api/v1/policies`;
-    const res = await fetch(url);
-    return res.json();
-  },
-
-  async togglePolicy(id: string): Promise<any> {
-    const res = await fetch(`${API_BASE}/api/v1/policies/${id}/toggle`, { method: 'POST' });
-    return res.json();
-  },
-
-  async simulatePolicy(params: any): Promise<any> {
-    const res = await fetch(`${API_BASE}/api/v1/policies/simulate`, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(params),
-    });
-    return res.json();
-  },
-
-  async getAuditEvents(filters?: { tenant_id?: string; tool?: string; decision?: string }): Promise<AuditEventInfo[]> {
+  getAuditEvents(filters?: { tenant_id?: string; tool?: string; decision?: string; event_type?: string }) {
     const params = new URLSearchParams();
-    if (filters?.tenant_id && filters.tenant_id !== 'ALL') params.append('tenant_id', filters.tenant_id);
-    if (filters?.tool && filters.tool !== 'ALL') params.append('tool', filters.tool);
-    if (filters?.decision && filters.decision !== 'ALL') params.append('decision', filters.decision);
-    const res = await fetch(`${API_BASE}/api/v1/audit/events?${params.toString()}`);
-    return res.json();
+    Object.entries(filters ?? {}).forEach(([k, v]) => {
+      if (v && v !== 'ALL') params.append(k, v);
+    });
+    return request<AuditEventInfo[]>(`/api/v1/audit/events?${params.toString()}`);
   },
+  verifyAuditIntegrity: () => request<any>('/api/v1/audit/verify'),
 
-  async verifyAuditIntegrity(): Promise<any> {
-    const res = await fetch(`${API_BASE}/api/v1/audit/verify`);
-    return res.json();
-  },
-
-  async runAttackSimulations(scenarioKey?: string): Promise<AttackSimulationResult[]> {
-    const url = scenarioKey ? `${API_BASE}/api/v1/simulations/run?scenario=${scenarioKey}` : `${API_BASE}/api/v1/simulations/run`;
-    const res = await fetch(url, { method: 'POST' });
-    return res.json();
-  },
-
-  async getSimulationResults(): Promise<any[]> {
-    const res = await fetch(`${API_BASE}/api/v1/simulations/results`);
-    return res.json();
-  },
+  getSimulationCatalog: () => request<ScenarioInfo[]>('/api/v1/simulations/catalog'),
+  runAttackSimulations: (scenarioKey?: string) =>
+    post<AttackSimulationResult[]>(
+      scenarioKey ? `/api/v1/simulations/run?scenario=${encodeURIComponent(scenarioKey)}` : '/api/v1/simulations/run',
+    ),
 };

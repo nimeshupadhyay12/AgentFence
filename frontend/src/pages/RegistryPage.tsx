@@ -39,7 +39,7 @@ export default function RegistryPage() {
                 <td><span className="badge badge-info">{a.agent_type}</span></td>
                 <td>{a.role}</td>
                 <td style={{ fontSize: '12px', color: 'var(--text-muted)' }}>{a.description}</td>
-                <td><span className="badge badge-allow">ACTIVE</span></td>
+                <td><span className={`badge ${a.is_active ? 'badge-allow' : 'badge-deny'}`}>{a.is_active ? 'ACTIVE' : 'INACTIVE'}</span></td>
               </tr>
             ))}
           </tbody>
@@ -53,6 +53,7 @@ export default function RegistryPage() {
             <tr>
               <th>Tool Name</th>
               <th>Description</th>
+              <th>Action</th>
               <th>Required Scopes</th>
               <th>Risk Level</th>
               <th>Upstream Endpoint</th>
@@ -64,6 +65,7 @@ export default function RegistryPage() {
               <tr key={t.id}>
                 <td><span className="code-pill">{t.name}</span></td>
                 <td style={{ fontSize: '12px' }}>{t.description}</td>
+                <td><span className="code-pill">{t.action}</span>{t.rate_limit_per_minute ? <div style={{ fontSize: '10.5px', color: 'var(--text-dim)' }}>{t.rate_limit_per_minute}/min</div> : null}</td>
                 <td>{t.required_scopes.map((s) => <span key={s} className="code-pill">{s}</span>)}</td>
                 <td>
                   <span className={`badge ${t.risk_level === 'critical' ? 'badge-deny' : t.risk_level === 'high' ? 'badge-warn' : 'badge-info'}`}>
@@ -71,7 +73,14 @@ export default function RegistryPage() {
                   </span>
                 </td>
                 <td style={{ fontSize: '11.5px', color: 'var(--text-dim)' }}>{t.upstream_endpoint}</td>
-                <td><span className="badge badge-allow">ENABLED</span></td>
+                <td>
+                  {t.is_quarantined ? (
+                    <span className="badge badge-deny" title={t.quarantine_reason ?? ''}>QUARANTINED</span>
+                  ) : (
+                    <span className={`badge ${t.is_enabled ? 'badge-allow' : 'badge-warn'}`}>{t.is_enabled ? 'ENABLED' : 'DISABLED'}</span>
+                  )}
+                  {t.requires_approval && <div><span className="badge badge-warn">APPROVAL</span></div>}
+                </td>
               </tr>
             ))}
           </tbody>
