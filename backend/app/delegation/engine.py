@@ -126,7 +126,7 @@ class DelegationEngine:
             event_type="delegation.create",
             tenant_id=delegator.tenant_id,
             user_id=delegator.id if delegator.type == "user" else None,
-            agent_id=delegator.id if delegator.type == "agent" else receiving_agent_id,
+            agent_id=delegator.id if delegator.type == "agent" else None,  # receiver is in details
             parent_delegation_id=parent_delegation_id,
             delegation_id=delegation_id,
             decision="ALLOW" if ok else "DENY",
@@ -358,10 +358,10 @@ class DelegationEngine:
         audit_service.log_event(
             db, event_type="delegation.revoke", tenant_id=grant.tenant_id,
             user_id=actor.id if actor.type == "user" else None,
-            agent_id=actor.id if actor.type == "agent" else grant.receiving_agent_id,
+            agent_id=actor.id if actor.type == "agent" else None,
             parent_delegation_id=grant.parent_delegation_id, delegation_id=grant.delegation_id,
             decision="ALLOW", reason_code="DELEGATION_REVOKED", execution_outcome="revoked",
-            details={"revoked_by": actor.id},
+            details={"revoked_by": actor.id, "receiving_agent_id": grant.receiving_agent_id},
         )
         return 200, "DELEGATION_REVOKED", f"Delegation '{delegation_id}' revoked (descendants are invalidated)"
 
