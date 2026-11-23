@@ -2,7 +2,7 @@
 
 Initialises (and seeds, if empty) the database on its own, runs every attack
 scenario against the real gateway pipeline and exits non-zero if any scenario
-was not blocked for the expected reason. Suitable for CI.
+was not stopped by the control it targets (asserted via reason codes). Suitable for CI.
 """
 import sys
 from pathlib import Path
@@ -25,8 +25,8 @@ def main() -> int:
     print("=" * 70)
     print(f"Executed: {total} attack scenarios | Passed: {passed}/{total}\n")
     for idx, r in enumerate(results, start=1):
-        status = "PASSED [BLOCKED]" if r["passed"] else "FAILED [EXPLOITED]"
-        print(f"[{idx}/{total}] {r['scenario_name']}")
+        status = "PASSED (stopped by the intended control)" if r["passed"] else "FAILED"
+        print(f"[{idx}/{total}] {r['scenario_name']}  ({r['owasp']})")
         print(f"     Expected: {r['expected_result']}")
         print(f"     Actual:   {r['actual_result']}")
         print(f"     Status:   {status}\n")

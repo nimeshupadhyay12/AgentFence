@@ -1,310 +1,515 @@
-"""AgentFence Delegation Engine: Attenuation Verification, Depth Enforcement, and Chain Validation
+"""AgentFence delegation engine: issuance with attenuation, verification and replay protection.
+
+Authority model
+---------------
+* Authority originates from a human user. A *root* delegation can only be
+  issued by an authenticated **user**, and only for tool/resource combinations
+  the policy engine would allow that user to use directly ("you cannot give
+  away what you do not hold").
+* An **agent** can only re-delegate authority it received: it must name a
+  parent grant issued *to it*, and the child scope must be a subset of the
+  parent scope (tools, resources, expiry, depth). Agents never create roots.
+* The delegator is always the authenticated caller and the tenant is always
+  the caller's tenant. Neither is ever taken from the request body.
+* Actions are a property of each tool (``MCPTool.action``) and are derived on
+  the server; the audience is fixed by gateway configuration.
+
+Only a SHA-256 fingerprint of each credential is stored. The raw credential is
+returned once, to the delegator, at creation time.
 """
 import json
-from datetime import datetime, timezone, timedelta
-from typing import Dict, Any, List, Optional, Tuple
-from sqlalchemy.orm import Session
-from app.models.entities import DelegationGrant, Agent, User
-from app.core.security import security_engine
+from dataclasses import dataclass
+from datetime import datetime, timedelta, timezone
+from typing import Any, Dict, List, Optional, Tuple
 
-class AttenuationViolationError(Exception):
-    def __init__(self, message: str, reason_code: str = "DELEGATION_ATTENUATION_ESCALATION"):
-        super().__init__(message)
-        self.reason_code = reason_code
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
+
+from app.audit.service import audit_service
+from app.core.auth import Principal
+from app.core.config import settings
+from app.core.security import security_engine
+from app.models.entities import Agent, DelegationGrant, MCPTool, ReplayIdentifier, User, as_utc
+from app.policies.engine import policy_engine
+
+# Maps a credential-verification failure to a delegation reason code.
+_TOKEN_CODE_MAP = {
+    "TOKEN_EXPIRED": "DELEGATION_EXPIRED",
+    "TOKEN_AUDIENCE_MISMATCH": "DELEGATION_AUDIENCE_MISMATCH",
+    "TOKEN_SIGNATURE_INVALID": "DELEGATION_TAMPERING_DETECTED",
+    "TOKEN_ALGORITHM_REJECTED": "DELEGATION_TAMPERING_DETECTED",
+    "TOKEN_UNKNOWN_KEY": "DELEGATION_TAMPERING_DETECTED",
+}
+
+_CREATE_ATTACK_CLASS = {
+    "DELEGATION_ATTENUATION_ESCALATION": "privilege_escalation",
+    "DELEGATION_EXCEEDS_DELEGATOR_AUTHORITY": "privilege_escalation",
+    "DELEGATOR_HAS_NO_AUTHORITY": "privilege_escalation",
+    "DELEGATION_DEPTH_EXCEEDED": "excessive_depth",
+    "DELEGATION_CHAIN_MISMATCH": "stolen_delegation",
+}
+
+
+@dataclass
+class DelegationResult:
+    ok: bool
+    code: str
+    message: str
+    grant: Optional[DelegationGrant] = None
+    token: Optional[str] = None  # raw credential: only on success, shown once
+    audit_event_id: Optional[str] = None
+
+
+@dataclass
+class VerificationResult:
+    ok: bool
+    code: str
+    message: str
+    payload: Optional[Dict[str, Any]] = None
+    grant: Optional[DelegationGrant] = None
+
 
 class DelegationEngine:
-    def __init__(self):
+    def __init__(self) -> None:
         self.security = security_engine
 
-    def validate_permission_attenuation(
-        self,
-        parent_grant: DelegationGrant,
-        requested_tools: List[str],
-        requested_actions: List[str],
-        requested_resources: List[str],
-        requested_expires_at: datetime,
-        requested_tenant_id: str,
-        requested_depth: int
-    ) -> Tuple[bool, Optional[str]]:
-        """Strict permission attenuation enforcement:
-        Child delegation MUST NEVER gain more authority than parent.
-        """
-        # 1. Tenant boundary must remain strictly identical
-        if requested_tenant_id != parent_grant.tenant_id:
-            return False, f"Delegation cannot cross tenant boundary: parent belongs to '{parent_grant.tenant_id}', requested '{requested_tenant_id}'"
+    # ---------------------------------------------------------------- helpers
+    @staticmethod
+    def _now() -> datetime:
+        return datetime.now(timezone.utc)
 
-        # 2. Tool permissions must be a subset of parent tools
-        parent_tools = set(parent_grant.get_permitted_tools())
-        child_tools = set(requested_tools)
-        escalated_tools = child_tools - parent_tools
-        if escalated_tools:
-            return False, f"Permission escalation: child requested tools {list(escalated_tools)} not permitted in parent delegation"
+    @staticmethod
+    def _is_unrestricted(resources: List[str]) -> bool:
+        return not resources or "*" in resources
 
-        # 3. Action permissions must be a subset of parent actions
-        parent_actions = set(parent_grant.get_permitted_actions())
-        child_actions = set(requested_actions)
-        escalated_actions = child_actions - parent_actions
-        if escalated_actions:
-            return False, f"Permission escalation: child requested actions {list(escalated_actions)} not permitted in parent delegation"
+    def chain_of(self, db: Session, grant: DelegationGrant) -> Tuple[List[DelegationGrant], Optional[str]]:
+        """Returns ``(ancestors closest-first, error)``; ``error`` is set if the chain is broken."""
+        chain: List[DelegationGrant] = []
+        seen = {grant.delegation_id}
+        current = grant
+        while current.parent_delegation_id:
+            parent = db.query(DelegationGrant).filter(
+                DelegationGrant.delegation_id == current.parent_delegation_id,
+                DelegationGrant.tenant_id == grant.tenant_id,
+            ).first()
+            if parent is None:
+                return chain, f"Ancestor delegation '{current.parent_delegation_id}' is missing"
+            if parent.delegation_id in seen:
+                return chain, f"Delegation chain contains a cycle at '{parent.delegation_id}'"
+            if parent.receiving_agent_id != current.delegating_agent_id:
+                return chain, (f"'{current.delegation_id}' was issued by '{current.delegating_agent_id}', "
+                               f"who is not the recipient of parent '{parent.delegation_id}'")
+            seen.add(parent.delegation_id)
+            chain.append(parent)
+            current = parent
+        return chain, None
 
-        # 4. Resource restrictions must be a subset of parent resources (if parent is restricted)
-        parent_resources = set(parent_grant.get_resource_restrictions())
-        child_resources = set(requested_resources)
-        if parent_resources and "*" not in parent_resources:
-            escalated_resources = child_resources - parent_resources
-            if escalated_resources:
-                return False, f"Permission escalation: child requested access to resources {list(escalated_resources)} outside parent boundary"
+    def _check_chain(self, db: Session, grant: DelegationGrant) -> Tuple[bool, str, str]:
+        chain, error = self.chain_of(db, grant)
+        if error:
+            return False, "BROKEN_DELEGATION_CHAIN", error
+        now = self._now()
+        for parent in chain:
+            if parent.is_revoked:
+                return False, "PARENT_DELEGATION_REVOKED", f"Ancestor delegation '{parent.delegation_id}' is revoked"
+            if as_utc(parent.expires_at) < now:
+                return False, "PARENT_DELEGATION_EXPIRED", (
+                    f"Ancestor delegation '{parent.delegation_id}' expired at {as_utc(parent.expires_at).isoformat()}"
+                )
+        return True, "CHAIN_VALID", "Delegation chain verified"
 
-        # 5. Expiration cannot exceed parent expiration
-        parent_exp = parent_grant.expires_at
-        if parent_exp.tzinfo is None:
-            parent_exp = parent_exp.replace(tzinfo=timezone.utc)
-        req_exp = requested_expires_at
-        if req_exp.tzinfo is None:
-            req_exp = req_exp.replace(tzinfo=timezone.utc)
+    def _log_create(self, db: Session, delegator: Principal, ok: bool, code: str, message: str,
+                    receiving_agent_id: Optional[str], parent_delegation_id: Optional[str],
+                    delegation_id: Optional[str], details: Dict[str, Any]) -> str:
+        event = audit_service.log_event(
+            db,
+            event_type="delegation.create",
+            tenant_id=delegator.tenant_id,
+            user_id=delegator.id if delegator.type == "user" else None,
+            agent_id=delegator.id if delegator.type == "agent" else receiving_agent_id,
+            parent_delegation_id=parent_delegation_id,
+            delegation_id=delegation_id,
+            decision="ALLOW" if ok else "DENY",
+            reason_code=code,
+            denial_reason=None if ok else message,
+            attack_classification=None if ok else _CREATE_ATTACK_CLASS.get(code),
+            execution_outcome="issued" if ok else "rejected",
+            details={"delegator": delegator.id, "delegator_type": delegator.type,
+                     "receiving_agent_id": receiving_agent_id, **details},
+        )
+        return event.id
 
-        if req_exp > parent_exp:
-            return False, f"Permission escalation: child expiration ({req_exp.isoformat()}) exceeds parent expiration ({parent_exp.isoformat()})"
-
-        # 6. Delegation depth limit
-        if requested_depth > parent_grant.max_depth:
-            return False, f"Delegation depth exceeded: requested depth {requested_depth} exceeds permitted max depth {parent_grant.max_depth}"
-
-        return True, None
-
+    # --------------------------------------------------------------- issuance
     def create_delegation(
         self,
         db: Session,
-        delegating_agent_id: str,
+        delegator: Principal,
         receiving_agent_id: str,
-        tenant_id: str,
         permitted_tools: List[str],
-        permitted_actions: List[str],
-        resource_restrictions: List[str],
+        resource_restrictions: Optional[List[str]] = None,
         parent_delegation_id: Optional[str] = None,
         duration_minutes: int = 60,
         is_single_use: bool = False,
-        audience: Optional[str] = None
-    ) -> Tuple[bool, Optional[DelegationGrant], str, str]:
-        """Creates a signed delegation credential with strict attenuation checks."""
-        now = datetime.now(timezone.utc)
-        requested_expires = now + timedelta(minutes=duration_minutes)
-        
-        # Verify receiving agent exists in same tenant
-        rcv_agent = db.query(Agent).filter(Agent.id == receiving_agent_id, Agent.tenant_id == tenant_id).first()
-        if not rcv_agent:
-            return False, None, "INVALID_RECEIVING_AGENT", f"Receiving agent '{receiving_agent_id}' does not exist in tenant '{tenant_id}'"
+        max_depth: Optional[int] = None,
+        delegation_id: Optional[str] = None,
+    ) -> DelegationResult:
+        """Issues a signed, attenuated delegation credential on behalf of ``delegator``."""
+        resources = [str(r) for r in (resource_restrictions or [])]
+        tools_req = [str(t) for t in (permitted_tools or [])]
+        details = {"permitted_tools": tools_req, "resource_restrictions": resources,
+                   "duration_minutes": duration_minutes, "is_single_use": is_single_use}
 
-        if not rcv_agent.is_active:
-            return False, None, "AGENT_INACTIVE", f"Receiving agent '{receiving_agent_id}' is deactivated"
+        def reject(code: str, message: str) -> DelegationResult:
+            audit_id = self._log_create(db, delegator, False, code, message, receiving_agent_id,
+                                        parent_delegation_id, None, details)
+            return DelegationResult(False, code, message, audit_event_id=audit_id)
 
-        current_depth = 1
-        max_depth = 3
-        original_user_id = delegating_agent_id
+        tenant_id = delegator.tenant_id
+        now = self._now()
 
-        # If child delegation, validate against parent
-        if parent_delegation_id:
-            parent_grant = db.query(DelegationGrant).filter(
+        # --- request sanity -------------------------------------------------
+        if not tools_req:
+            return reject("INVALID_DELEGATION_REQUEST", "At least one tool must be delegated")
+        if "*" in tools_req:
+            return reject("INVALID_DELEGATION_REQUEST", "Wildcard tool delegation is not allowed; list tools explicitly")
+        try:
+            duration = int(duration_minutes)
+        except (TypeError, ValueError):
+            return reject("INVALID_DELEGATION_REQUEST", "duration_minutes must be an integer")
+        if duration < 1 or duration > settings.MAX_DELEGATION_TTL_MINUTES:
+            return reject("INVALID_DELEGATION_REQUEST",
+                          f"duration_minutes must be between 1 and {settings.MAX_DELEGATION_TTL_MINUTES}")
+        expires_at = now + timedelta(minutes=duration)
+
+        tools: List[MCPTool] = []
+        for name in dict.fromkeys(tools_req):
+            tool = db.query(MCPTool).filter(MCPTool.name == name).first()
+            if tool is None or not tool.is_enabled or tool.is_quarantined:
+                return reject("INVALID_DELEGATION_REQUEST", f"Tool '{name}' is not registered, disabled or quarantined")
+            tools.append(tool)
+        tool_names = [t.name for t in tools]
+        actions = sorted({t.action for t in tools})
+
+        receiver = db.get(Agent, receiving_agent_id) if receiving_agent_id else None
+        if receiver is None or receiver.tenant_id != tenant_id:
+            return reject("INVALID_RECEIVING_AGENT",
+                          f"Receiving agent '{receiving_agent_id}' does not exist in tenant '{tenant_id}'")
+        if not receiver.is_active:
+            return reject("AGENT_INACTIVE", f"Receiving agent '{receiving_agent_id}' is deactivated")
+        if receiver.id == delegator.id:
+            return reject("INVALID_DELEGATION_REQUEST", "An agent cannot delegate to itself")
+
+        global_max = settings.MAX_DELEGATION_DEPTH
+        original_user_id = delegator.id
+
+        if parent_delegation_id is None:
+            # --- root delegation: only a user, only what the user holds -------
+            if delegator.type != "user":
+                return reject("DELEGATOR_HAS_NO_AUTHORITY",
+                              f"Agent '{delegator.id}' holds no authority of its own; it can only re-delegate "
+                              f"a grant issued to it (parent_delegation_id required)")
+            for tool in tools:
+                targets: List[Optional[str]] = [None]
+                if tool.resource_param and not self._is_unrestricted(resources):
+                    targets = list(resources)
+                for target in targets:
+                    decision = policy_engine.evaluate(
+                        db=db, principal_id=delegator.id, principal_type="user", principal_role=delegator.role,
+                        acting_agent_id=None, tenant_id=tenant_id, tool_name=tool.name,
+                        requested_action=tool.action, resource_id=target,
+                        correlation_id=self.security.generate_id("delchk"),
+                    )
+                    if decision.decision != "ALLOW":
+                        return reject(
+                            "DELEGATION_EXCEEDS_DELEGATOR_AUTHORITY",
+                            f"'{delegator.id}' cannot delegate '{tool.name}' on '{target or 'any resource'}': "
+                            f"the delegator does not hold that permission ({decision.reason_code})",
+                        )
+            current_depth = 1
+            depth_cap = global_max if max_depth is None else int(max_depth)
+            if depth_cap < 1 or depth_cap > global_max:
+                return reject("DELEGATION_DEPTH_EXCEEDED",
+                              f"max_depth must be between 1 and the gateway limit {global_max}")
+        else:
+            # --- child delegation: strict attenuation of the parent ------------
+            parent = db.query(DelegationGrant).filter(
                 DelegationGrant.delegation_id == parent_delegation_id,
-                DelegationGrant.tenant_id == tenant_id
+                DelegationGrant.tenant_id == tenant_id,
             ).first()
+            if parent is None:
+                return reject("PARENT_DELEGATION_NOT_FOUND",
+                              f"Parent delegation '{parent_delegation_id}' not found in tenant '{tenant_id}'")
+            if delegator.type != "agent" or parent.receiving_agent_id != delegator.id:
+                return reject("DELEGATION_CHAIN_MISMATCH",
+                              f"'{delegator.id}' cannot delegate from grant '{parent_delegation_id}' "
+                              f"issued to '{parent.receiving_agent_id}'")
+            if parent.is_revoked:
+                return reject("PARENT_DELEGATION_REVOKED", f"Parent delegation '{parent_delegation_id}' is revoked")
+            if as_utc(parent.expires_at) < now:
+                return reject("PARENT_DELEGATION_EXPIRED", f"Parent delegation '{parent_delegation_id}' has expired")
+            if parent.is_single_use:
+                return reject("DELEGATION_ATTENUATION_ESCALATION", "A single-use delegation cannot be re-delegated")
+            chain_ok, chain_code, chain_msg = self._check_chain(db, parent)
+            if not chain_ok:
+                return reject(chain_code, chain_msg)
 
-            if not parent_grant:
-                return False, None, "PARENT_DELEGATION_NOT_FOUND", f"Parent delegation '{parent_delegation_id}' not found in tenant '{tenant_id}'"
+            escalated_tools = sorted(set(tool_names) - set(parent.get_permitted_tools()))
+            if escalated_tools:
+                return reject("DELEGATION_ATTENUATION_ESCALATION",
+                              f"Permission escalation: tools {escalated_tools} are not in the parent delegation")
+            parent_resources = parent.get_resource_restrictions()
+            if not self._is_unrestricted(parent_resources):
+                if self._is_unrestricted(resources):
+                    return reject("DELEGATION_ATTENUATION_ESCALATION",
+                                  f"Permission escalation: parent is restricted to {parent_resources}; "
+                                  f"the child must list a subset")
+                outside = sorted(set(resources) - set(parent_resources))
+                if outside:
+                    return reject("DELEGATION_ATTENUATION_ESCALATION",
+                                  f"Permission escalation: resources {outside} are outside the parent boundary")
+            current_depth = parent.current_depth + 1
+            depth_cap = min(parent.max_depth, global_max)
+            if max_depth is not None:
+                depth_cap = min(depth_cap, int(max_depth))
+            if current_depth > depth_cap:
+                return reject("DELEGATION_DEPTH_EXCEEDED",
+                              f"Delegation depth exceeded: depth {current_depth} is above the permitted "
+                              f"maximum {depth_cap}")
+            # A child can never outlive its parent.
+            expires_at = min(expires_at, as_utc(parent.expires_at))
+            original_user_id = parent.original_user_id
 
-            if parent_grant.is_revoked:
-                return False, None, "PARENT_DELEGATION_REVOKED", f"Parent delegation '{parent_delegation_id}' is revoked"
-
-            # Check if parent is expired
-            parent_exp = parent_grant.expires_at
-            if parent_exp.tzinfo is None:
-                parent_exp = parent_exp.replace(tzinfo=timezone.utc)
-            if parent_exp < now:
-                return False, None, "PARENT_DELEGATION_EXPIRED", f"Parent delegation '{parent_delegation_id}' has already expired"
-
-            # The parent grant's authority belongs to its receiving agent.
-            if parent_grant.receiving_agent_id != delegating_agent_id:
-                return False, None, "DELEGATION_CHAIN_MISMATCH", (
-                    f"Agent '{delegating_agent_id}' cannot delegate from grant "
-                    f"'{parent_delegation_id}' issued to '{parent_grant.receiving_agent_id}'"
-                )
-
-            # Automatically clamp child expiration to at most parent expiration
-            if requested_expires > parent_exp:
-                requested_expires = parent_exp
-
-            current_depth = parent_grant.current_depth + 1
-            max_depth = parent_grant.max_depth
-            original_user_id = parent_grant.original_user_id
-
-            # Enforce attenuation
-            is_valid_att, err_msg = self.validate_permission_attenuation(
-                parent_grant=parent_grant,
-                requested_tools=permitted_tools,
-                requested_actions=permitted_actions,
-                requested_resources=resource_restrictions,
-                requested_expires_at=requested_expires,
-                requested_tenant_id=tenant_id,
-                requested_depth=current_depth
-            )
-            if not is_valid_att:
-                code = "DELEGATION_DEPTH_EXCEEDED" if "depth" in (err_msg or "").lower() else "DELEGATION_ATTENUATION_ESCALATION"
-                return False, None, code, err_msg or "Permission attenuation violation"
-
-        delegation_id = self.security.generate_id("del")
+        new_id = delegation_id or self.security.generate_id("del")
         token = self.security.create_delegation_credential(
-            delegation_id=delegation_id,
+            delegation_id=new_id,
             parent_delegation_id=parent_delegation_id,
             original_user_id=original_user_id,
-            delegating_agent_id=delegating_agent_id,
-            receiving_agent_id=receiving_agent_id,
+            delegating_agent_id=delegator.id,
+            receiving_agent_id=receiver.id,
             tenant_id=tenant_id,
-            permitted_tools=permitted_tools,
-            permitted_actions=permitted_actions,
-            resource_restrictions=resource_restrictions,
-            max_depth=max_depth,
+            permitted_tools=tool_names,
+            permitted_actions=actions,
+            resource_restrictions=resources,
+            max_depth=depth_cap,
             current_depth=current_depth,
-            audience=audience,
-            expires_at=requested_expires,
-            is_single_use=is_single_use
+            expires_at=expires_at,
+            is_single_use=is_single_use,
         )
-
-        _, payload, _ = self.security.verify_delegation_credential(token, expected_audience=audience)
+        ok, payload, _, msg = self.security.verify_delegation_credential(token)
+        if not ok or payload is None:  # pragma: no cover - would indicate a key-ring bug
+            raise RuntimeError(f"Freshly issued delegation credential failed verification: {msg}")
 
         grant = DelegationGrant(
             id=self.security.generate_id("grant"),
-            delegation_id=delegation_id,
+            delegation_id=new_id,
             parent_delegation_id=parent_delegation_id,
             tenant_id=tenant_id,
             original_user_id=original_user_id,
-            delegating_agent_id=delegating_agent_id,
-            receiving_agent_id=receiving_agent_id,
-            permitted_tools_json=json.dumps(permitted_tools),
-            permitted_actions_json=json.dumps(permitted_actions),
-            resource_restrictions_json=json.dumps(resource_restrictions),
+            delegating_agent_id=delegator.id,
+            delegator_type=delegator.type,
+            receiving_agent_id=receiver.id,
+            permitted_tools_json=json.dumps(tool_names),
+            permitted_actions_json=json.dumps(actions),
+            resource_restrictions_json=json.dumps(resources),
             issued_at=now,
-            expires_at=requested_expires,
-            max_depth=max_depth,
+            expires_at=datetime.fromtimestamp(payload["exp"], tz=timezone.utc),
+            max_depth=depth_cap,
             current_depth=current_depth,
             jti=payload["jti"],
             audience=payload["aud"],
-            signature=token,
+            token_fingerprint=self.security.fingerprint(token),
             is_single_use=is_single_use,
             is_consumed=False,
             is_revoked=False,
-            created_at=now
+            created_at=now,
         )
         db.add(grant)
         db.commit()
         db.refresh(grant)
-        return True, grant, "DELEGATION_CREATED", "Delegation created successfully"
+        audit_id = self._log_create(db, delegator, True, "DELEGATION_CREATED", "Delegation created",
+                                    receiver.id, parent_delegation_id, new_id,
+                                    {**details, "depth": current_depth, "max_depth": depth_cap})
+        return DelegationResult(True, "DELEGATION_CREATED", "Delegation created successfully", grant, token, audit_id)
 
+    # ------------------------------------------------------------- revocation
+    def revoke(self, db: Session, actor: Principal, delegation_id: str) -> Tuple[int, str, str]:
+        """Returns (http_status, code, message). Revoking a grant invalidates all descendants."""
+        grant = db.query(DelegationGrant).filter(DelegationGrant.delegation_id == delegation_id).first()
+        allowed = grant is not None and (
+            actor.can_manage_tenant(grant.tenant_id)
+            or (actor.tenant_id == grant.tenant_id and actor.id in (grant.original_user_id, grant.delegating_agent_id))
+        )
+        if grant is None or not allowed:
+            # Same answer for "missing" and "not yours": no cross-tenant probing.
+            audit_service.log_event(
+                db, event_type="delegation.revoke", tenant_id=actor.tenant_id,
+                user_id=actor.id if actor.type == "user" else None,
+                agent_id=actor.id if actor.type == "agent" else None,
+                delegation_id=delegation_id, decision="DENY", reason_code="DELEGATION_NOT_FOUND",
+                denial_reason="Delegation not found or caller may not revoke it",
+                execution_outcome="rejected",
+            )
+            return 404, "DELEGATION_NOT_FOUND", "Delegation not found"
+        if not grant.is_revoked:
+            grant.is_revoked = True
+            grant.revoked_by = actor.id
+            grant.revoked_at = self._now()
+            db.commit()
+        audit_service.log_event(
+            db, event_type="delegation.revoke", tenant_id=grant.tenant_id,
+            user_id=actor.id if actor.type == "user" else None,
+            agent_id=actor.id if actor.type == "agent" else grant.receiving_agent_id,
+            parent_delegation_id=grant.parent_delegation_id, delegation_id=grant.delegation_id,
+            decision="ALLOW", reason_code="DELEGATION_REVOKED", execution_outcome="revoked",
+            details={"revoked_by": actor.id},
+        )
+        return 200, "DELEGATION_REVOKED", f"Delegation '{delegation_id}' revoked (descendants are invalidated)"
+
+    # ----------------------------------------------------------- verification
     def verify_active_delegation(
         self,
         db: Session,
         delegation_token: str,
-        expected_agent_id: str,
-        expected_tool: str,
-        expected_action: str,
-        expected_resource: Optional[str] = None,
-        expected_audience: Optional[str] = None
-    ) -> Tuple[bool, Optional[Dict[str, Any]], str, str]:
-        """Cryptographically verifies delegation token, attenuation chain, and scope."""
-        # 1. Cryptographic token verification
-        valid, payload, msg = self.security.verify_delegation_credential(
-            delegation_token,
-            expected_audience=expected_audience
-        )
-        if not valid or not payload:
-            if "expired" in msg.lower():
-                return False, None, "DELEGATION_EXPIRED", msg
-            elif "audience" in msg.lower():
-                return False, None, "DELEGATION_AUDIENCE_MISMATCH", msg
-            elif "tamper" in msg.lower() or "signature" in msg.lower():
-                return False, None, "DELEGATION_TAMPERING_DETECTED", msg
-            return False, None, "DELEGATION_TOKEN_INVALID", msg
+        acting_agent_id: str,
+        acting_tenant_id: str,
+        tool_name: str,
+        action: str,
+        resource_id: Optional[str] = None,
+    ) -> VerificationResult:
+        """Verifies a presented credential, its registry record, scope and full chain.
 
-        del_id = payload.get("del_id")
-        jti = payload.get("jti")
-        token_tid = payload.get("tid")
-        rcv_aid = payload.get("rcv_aid")
-        exp_timestamp = payload.get("exp", 0)
+        Single-use credentials are *not* consumed here; the gateway calls
+        :meth:`consume_single_use` only after every other check passed.
+        """
+        ok, payload, token_code, msg = self.security.verify_delegation_credential(delegation_token)
+        if not ok or payload is None:
+            code = _TOKEN_CODE_MAP.get(token_code, "DELEGATION_TOKEN_INVALID")
+            return VerificationResult(False, code, f"{msg} [{token_code}]")
 
-        # 2. Check receiving agent matches
-        if rcv_aid != expected_agent_id:
-            return False, payload, "AGENT_IDENTITY_MISMATCH", f"Delegation token issued to '{rcv_aid}', but presented by '{expected_agent_id}'"
+        del_id = payload["del_id"]
+        if payload["rcv_aid"] != acting_agent_id:
+            return VerificationResult(False, "AGENT_IDENTITY_MISMATCH",
+                                      f"Delegation issued to '{payload['rcv_aid']}' was presented by "
+                                      f"'{acting_agent_id}'", payload)
+        if payload["tid"] != acting_tenant_id:
+            return VerificationResult(False, "DELEGATION_TENANT_MISMATCH",
+                                      f"Delegation belongs to tenant '{payload['tid']}', caller is in "
+                                      f"'{acting_tenant_id}'", payload)
 
-        # 3. Check delegation record in DB
         grant = db.query(DelegationGrant).filter(
             DelegationGrant.delegation_id == del_id,
-            DelegationGrant.tenant_id == token_tid
+            DelegationGrant.tenant_id == payload["tid"],
         ).first()
-
-        if not grant:
-            return False, payload, "DELEGATION_NOT_FOUND", f"Delegation grant '{del_id}' not found in tenant registry"
-
+        if grant is None:
+            return VerificationResult(False, "DELEGATION_NOT_FOUND",
+                                      f"Delegation '{del_id}' is not in the registry", payload)
+        if grant.jti != payload["jti"] or grant.token_fingerprint != self.security.fingerprint(delegation_token):
+            return VerificationResult(False, "DELEGATION_TOKEN_MISMATCH",
+                                      f"Credential does not match the registered grant '{del_id}'", payload, grant)
         if grant.is_revoked:
-            return False, payload, "DELEGATION_REVOKED", f"Delegation '{del_id}' was revoked by administrator"
-
-        # The stored grant expiry is authoritative even if a token outlives it.
-        grant_expires = grant.expires_at
-        if grant_expires.tzinfo is None:
-            grant_expires = grant_expires.replace(tzinfo=timezone.utc)
-        if grant_expires < datetime.now(timezone.utc):
-            return False, payload, "DELEGATION_EXPIRED", f"Delegation '{del_id}' expired at {grant_expires.isoformat()}"
-
-        # 4. Reject already-consumed single-use delegations
+            return VerificationResult(False, "DELEGATION_REVOKED", f"Delegation '{del_id}' was revoked", payload, grant)
+        if as_utc(grant.expires_at) < self._now():
+            return VerificationResult(False, "DELEGATION_EXPIRED", f"Delegation '{del_id}' has expired", payload, grant)
         if grant.is_single_use and grant.is_consumed:
-            return False, payload, "REPLAY_ATTACK_DETECTED", f"Single-use delegation '{del_id}' has already been consumed"
+            return VerificationResult(False, "REPLAY_ATTACK_DETECTED",
+                                      f"Single-use delegation '{del_id}' has already been consumed", payload, grant)
+        if grant.current_depth > grant.max_depth or grant.current_depth > settings.MAX_DELEGATION_DEPTH:
+            return VerificationResult(False, "EXCESSIVE_DELEGATION_DEPTH",
+                                      f"Delegation depth {grant.current_depth} exceeds the permitted maximum "
+                                      f"{min(grant.max_depth, settings.MAX_DELEGATION_DEPTH)}", payload, grant)
 
-        # 5. Delegation Depth limit check
-        if grant.current_depth > grant.max_depth:
-            return False, payload, "EXCESSIVE_DELEGATION_DEPTH", f"Delegation depth {grant.current_depth} exceeds max allowed depth {grant.max_depth}"
+        tools = grant.get_permitted_tools()
+        if tool_name not in tools:
+            return VerificationResult(False, "UNAUTHORIZED_TOOL_EXECUTION",
+                                      f"Tool '{tool_name}' is not in the delegated tool scope {tools}", payload, grant)
+        actions = grant.get_permitted_actions()
+        if action not in actions:
+            return VerificationResult(False, "UNAUTHORIZED_ACTION",
+                                      f"Action '{action}' is not in the delegated actions {actions}", payload, grant)
+        restrictions = grant.get_resource_restrictions()
+        if resource_id is not None and not self._is_unrestricted(restrictions) and resource_id not in restrictions:
+            return VerificationResult(False, "RESOURCE_ACCESS_RESTRICTED",
+                                      f"Resource '{resource_id}' is outside the delegation boundary {restrictions}",
+                                      payload, grant)
 
-        # 6. Tool scope check
-        permitted_tools = grant.get_permitted_tools()
-        if expected_tool not in permitted_tools and "*" not in permitted_tools:
-            return False, payload, "UNAUTHORIZED_TOOL_EXECUTION", f"Tool '{expected_tool}' is not in delegated tool scope {permitted_tools}"
+        chain_ok, chain_code, chain_msg = self._check_chain(db, grant)
+        if not chain_ok:
+            return VerificationResult(False, chain_code, chain_msg, payload, grant)
+        return VerificationResult(True, "DELEGATION_VALID", "Delegation credential and chain verified", payload, grant)
 
-        # 7. Action scope check
-        permitted_actions = grant.get_permitted_actions()
-        if expected_action not in permitted_actions and "*" not in permitted_actions:
-            return False, payload, "UNAUTHORIZED_ACTION", f"Action '{expected_action}' is not in delegated actions {permitted_actions}"
+    def consume_single_use(self, db: Session, grant: DelegationGrant, jti: str,
+                           consumer_agent_id: str) -> Tuple[bool, str, str]:
+        """Atomically and durably burns a single-use credential.
 
-        # 8. Resource restriction check
-        if expected_resource:
-            permitted_resources = grant.get_resource_restrictions()
-            if permitted_resources and "*" not in permitted_resources:
-                if expected_resource not in permitted_resources:
-                    return False, payload, "RESOURCE_ACCESS_RESTRICTED", f"Resource '{expected_resource}' is restricted by delegation boundary {permitted_resources}"
-
-        # 9. Verify full parent chain recursion
-        curr_pdel_id = grant.parent_delegation_id
-        while curr_pdel_id:
-            parent = db.query(DelegationGrant).filter(
-                DelegationGrant.delegation_id == curr_pdel_id,
-                DelegationGrant.tenant_id == token_tid
-            ).first()
-            if not parent:
-                return False, payload, "BROKEN_DELEGATION_CHAIN", f"Ancestor delegation '{curr_pdel_id}' missing in chain"
-            if parent.is_revoked:
-                return False, payload, "PARENT_DELEGATION_REVOKED", f"Ancestor delegation '{curr_pdel_id}' in chain is revoked"
-            parent_expires = parent.expires_at
-            if parent_expires.tzinfo is None:
-                parent_expires = parent_expires.replace(tzinfo=timezone.utc)
-            if parent_expires < datetime.now(timezone.utc):
-                return False, payload, "PARENT_DELEGATION_EXPIRED", f"Ancestor delegation '{curr_pdel_id}' in chain expired at {parent_expires.isoformat()}"
-            curr_pdel_id = parent.parent_delegation_id
-
-        # Consume single-use grants only after every scope check succeeds.
-        if grant.is_single_use:
-            replay_ok, replay_msg = self.security.check_and_consume_jti(jti, exp_timestamp)
-            if not replay_ok:
-                return False, payload, "REPLAY_ATTACK_DETECTED", replay_msg
-
-            grant.is_consumed = True
+        Two guards, both enforced by the database (so they hold across threads,
+        worker processes and restarts):
+        1. INSERT into ``replay_identifiers`` (UNIQUE ``jti``);
+        2. conditional ``UPDATE ... SET is_consumed = 1 WHERE is_consumed = 0``.
+        Only the request that wins both commits; every other one is a replay.
+        """
+        try:
+            db.add(ReplayIdentifier(
+                id=self.security.generate_id("rpl"),
+                jti=jti,
+                delegation_id=grant.delegation_id,
+                consumer_agent_id=consumer_agent_id,
+                consumed_at=self._now(),
+                expires_at=as_utc(grant.expires_at),
+            ))
+            db.flush()
+            updated = (
+                db.query(DelegationGrant)
+                .filter(DelegationGrant.id == grant.id, DelegationGrant.is_consumed.is_(False))
+                .update({DelegationGrant.is_consumed: True}, synchronize_session=False)
+            )
+            if updated != 1:
+                db.rollback()
+                return False, "REPLAY_ATTACK_DETECTED", f"Single-use delegation '{grant.delegation_id}' already consumed"
             db.commit()
+        except IntegrityError:
+            db.rollback()
+            return False, "REPLAY_ATTACK_DETECTED", f"Credential jti '{jti}' has already been used (replay)"
+        return True, "CONSUMED", "Single-use delegation consumed"
 
-        return True, payload, "DELEGATION_VALID", "Delegation credentials and hierarchy verified"
+    # ------------------------------------------------------------- inspection
+    @staticmethod
+    def serialize(grant: DelegationGrant) -> Dict[str, Any]:
+        """Public view of a grant. Never includes the bearer credential."""
+        return {
+            "id": grant.id,
+            "delegation_id": grant.delegation_id,
+            "parent_delegation_id": grant.parent_delegation_id,
+            "tenant_id": grant.tenant_id,
+            "original_user_id": grant.original_user_id,
+            "delegating_agent_id": grant.delegating_agent_id,
+            "delegator_type": grant.delegator_type,
+            "receiving_agent_id": grant.receiving_agent_id,
+            "permitted_tools": grant.get_permitted_tools(),
+            "permitted_actions": grant.get_permitted_actions(),
+            "resource_restrictions": grant.get_resource_restrictions(),
+            "current_depth": grant.current_depth,
+            "max_depth": grant.max_depth,
+            "is_single_use": grant.is_single_use,
+            "is_consumed": grant.is_consumed,
+            "is_revoked": grant.is_revoked,
+            "revoked_by": grant.revoked_by,
+            "expires_at": as_utc(grant.expires_at).isoformat(),
+            "jti": grant.jti,
+            "token_fingerprint": grant.token_fingerprint,
+        }
+
+    @staticmethod
+    def load_principal(db: Session, principal_id: str, principal_type: str) -> Optional[Principal]:
+        """Loads an active principal from the database (used for chain-wide authorization)."""
+        if principal_type == "user":
+            user = db.get(User, principal_id)
+            if user is None or not user.is_active:
+                return None
+            return Principal(user.id, "user", user.tenant_id, user.role, user.is_admin)
+        agent = db.get(Agent, principal_id)
+        if agent is None or not agent.is_active:
+            return None
+        return Principal(agent.id, "agent", agent.tenant_id, agent.role)
+
 
 delegation_engine = DelegationEngine()

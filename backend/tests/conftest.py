@@ -27,3 +27,37 @@ def pytest_sessionfinish(session, exitstatus):
     except Exception:
         pass
     shutil.rmtree(_TEST_DATA_DIR, ignore_errors=True)
+
+
+import pytest  # noqa: E402
+
+
+@pytest.fixture(scope="session", autouse=True)
+def demo_credentials():
+    """Fresh schema + demo data for the whole session; returns the generated credentials."""
+    from app.database.seed import seed_database
+    return seed_database(force=True)
+
+
+@pytest.fixture
+def db():
+    from app.database.session import SessionLocal
+    session = SessionLocal()
+    try:
+        yield session
+    finally:
+        session.close()
+
+
+@pytest.fixture(autouse=True)
+def _reset_rate_limits():
+    from app.core.ratelimit import gateway_rate_limiter, login_rate_limiter
+    gateway_rate_limiter.reset()
+    login_rate_limiter.reset()
+    yield
+
+
+@pytest.fixture
+def scratch_dir():
+    """A private temporary directory inside the session's data dir (avoids the system temp root)."""
+    return Path(tempfile.mkdtemp(dir=_TEST_DATA_DIR))
