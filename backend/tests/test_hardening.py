@@ -240,3 +240,41 @@ def test_legacy_v1_chain_can_still_be_verified(scratch_dir):
     conn.commit()
     conn.close()
     assert audit_service.verify_legacy_sqlite_chain(str(path))[0] is False
+
+
+def test_end_to_end_real_upstream_mode(db, monkeypatch):
+    """Register a tool backed by the sample MCP server and call it through the full pipeline."""
+    import importlib.util
+    from pathlib import Path
+
+    from starlette.testclient import TestClient
+
+    from app.gateway.tool_registry import register_tool
+
+    path = Path(__file__).resolve().parents[2] / "scripts" / "sample_upstream_mcp.py"
+    spec = importlib.util.spec_from_file_location("sample_upstream_mcp", path)
+    sample = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(sample)
+    monkeypatch.setattr(gateway_interceptor.upstream, "transport", TestClient(sample.app)._transport)
+
+    secops = Principal("usr_secops_admin", "user", "tenant_platform", "platform_admin", True)
+    status, code, _, _ = register_tool(db, secops, {
+        "name": "lookup_cve", "description": "Look up a CVE summary.", "risk_level": "low", "action": "read",
+        "parameters_schema": {"type": "object", "properties": {
+            "cve_id": {"type": "string", "pattern": "^CVE-[0-9]{4}-[0-9]{4,7}$"}}, "required": ["cve_id"]},
+        "upstream_endpoint": "http://127.0.0.1:8001/mcp", "requires_approval": False,
+    })
+    assert status == 201 and code == "TOOL_REGISTERED"
+    bad = register_tool(db, secops, {"name": "evil_fetch", "description": "x", "upstream_endpoint": "http://10.1.2.3/"})
+    assert bad[0] == 400
+
+    token = issue_token_for(Principal("usr_alpha_admin", "user", "tenant_alpha", "admin", True))
+    ok = gateway_interceptor.process_tool_invocation(db, "lookup_cve", {"cve_id": "CVE-2021-44228"},
+                                                     identity_token=token)
+    assert ok["decision"] == "ALLOW", ok
+    text = ok["result"]["content"][0]["text"]
+    assert "Log4Shell" in text and "usr_alpha_admin" in text
+    analyst = issue_token_for(Principal("usr_alpha_analyst", "user", "tenant_alpha", "analyst", False))
+    denied = gateway_interceptor.process_tool_invocation(db, "lookup_cve", {"cve_id": "CVE-2021-44228"},
+                                                         identity_token=analyst)
+    assert denied["reason_code"] == "AUTHZ_NO_MATCHING_ALLOW_POLICY"
